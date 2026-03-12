@@ -2,7 +2,6 @@
 import streamlit as st
 import pandas as pd
 import re
-from collections import defaultdict
 from difflib import get_close_matches
 from io import BytesIO
 
@@ -13,13 +12,18 @@ st.set_page_config(page_title="WMS Mapping Validator", layout="wide")
 # ----------------------
 MATCH_THRESHOLD = 0.5
 
+# Patterns based on rules:
+# - LOTTABLE01: shipment|PO
+# - LOTTABLE03: ProjectID starts with 1105/2609/0000
+# - LOTTABLE06: WBS full pattern OR short like EID21/EID24
+# - LOTTABLE10: FASID numeric|text
 PATTERNS = {
-    "LOTTABLE01": re.compile(r"^[^|]+\|[^|]+$"),               # shipment|PO (if used)
-    "LOTTABLE02": re.compile(r"^[A-Z0-9][A-Z0-9 \-]{2,}$", re.I),  # Project Scope
-    "LOTTABLE03": re.compile(r"^\d{4}\.[A-Z0-9\-]+$", re.I),   # ProjectID like 1105.SOMETHING
-    "LOTTABLE06": re.compile(r"^[A-Z0-9]{3,}\.\d{6}\.\d{5}$", re.I),  # WBS like EID27.241002.11003
+    "LOTTABLE01": re.compile(r"^[^|]+\|[^|]+$"),               # shipment|PO
+    "LOTTABLE02": None,                                       # Project Scope (free text)
+    "LOTTABLE03": re.compile(r"^(?:1105|2609|0000)\.[A-Z0-9\-]+$", re.I),  # ProjectID
+    "LOTTABLE06": re.compile(r"^(?:[A-Z0-9]{3,}\.\d{6}\.\d{5}|EID\d{2,})$", re.I),  # WBS
     "LOTTABLE07": re.compile(r"[A-Z0-9\-]{4,}", re.I),         # serial-ish
-    "LOTTABLE09": re.compile(r"^[A-Z0-9\-]+-EID$", re.I),     # Owner ID ends with -EID
+    "LOTTABLE09": None,                                       # Owner: no strict rule
     "LOTTABLE10": re.compile(r"^\d+\|.+$"),                   # numeric|text (FASID)
 }
 
@@ -56,12 +60,13 @@ def to_excel_bytes(dfs_dict):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, df in dfs_dict.items():
-            # ensure df is a DataFrame
+            # ensure sheet name length <= 31
+            safe_name = str(name)[:31]
             if isinstance(df, pd.DataFrame):
-                df.to_excel(writer, sheet_name=name[:31], index=False)
+                df.to_excel(writer, sheet_name=safe_name, index=False)
             else:
                 # fallback: wrap into DataFrame
-                pd.DataFrame([str(df)]).to_excel(writer, sheet_name=name[:31], index=False)
+                pd.DataFrame([str(df)]).to_excel(writer, sheet_name=safe_name, index=False)
     buffer.seek(0)
     return buffer
 
@@ -70,17 +75,22 @@ def to_excel_bytes(dfs_dict):
 # ----------------------
 def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
     """
-    file_like: path or file-like object (e.g. Streamlit UploadedFile)
-    returns dict with keys: summary_df, errors_summary (DataFrame), error_rows (DataFrame), orig (dict of DataFrames)
+    Reads an Excel workbook (path or file-like) and validates according to rules.
+    Returns dict with:
+      - summary_df (DataFrame)
+      - errors_summary (DataFrame)
+      - error_rows (DataFrame)
+      - orig (dict of original DataFrames)
     """
     result = {"summary": [], "errors": [], "error_rows": [], "orig": {}}
 
-    # try read entire workbook as dict of dataframes
+    # read workbook as dict of DataFrames
     try:
         xls_dict = pd.read_excel(file_like, sheet_name=None, dtype=str)
     except Exception as e:
         result["errors"].append({
-            "type": "file_read_error",
+            "code": "FILE_READ_ERROR",
+            "severity": "CRITICAL",
             "message": f"Gagal membaca file Excel: {e}",
             "details": {}
         })
@@ -89,7 +99,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
 
     sheets = list(xls_dict.keys())
 
-    # fallback: try to auto-detect header/detail sheet names
+    # auto-detect sheet names if default not present
     if sheet_header not in sheets or sheet_detail not in sheets:
         header_sheet = find_similar_column(sheets, [sheet_header, "Header", "Data"])
         detail_sheet = find_similar_column(sheets, [sheet_detail, "Detail", "Lines", "Items"])
@@ -98,10 +108,10 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
         if detail_sheet:
             sheet_detail = detail_sheet
 
-    # if still not found, return friendly error
     if sheet_header not in sheets or sheet_detail not in sheets:
         result["errors"].append({
-            "type": "sheet_missing",
+            "code": "SHEET_NOT_FOUND",
+            "severity": "CRITICAL",
             "message": "Nama sheet header/detail tidak ditemukan di workbook.",
             "details": {"available_sheets": sheets, "requested_header": sheet_header, "requested_detail": sheet_detail}
         })
@@ -110,141 +120,175 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
 
     header_df = xls_dict[sheet_header].copy()
     detail_df = xls_dict[sheet_detail].copy()
-
     result["orig"][f"orig_{sheet_header}"] = header_df
     result["orig"][f"orig_{sheet_detail}"] = detail_df
 
+    # detect generic key columns
     header_gk = detect_generic_key_col(header_df.columns)
     detail_gk = detect_generic_key_col(detail_df.columns)
-
     if not header_gk or not detail_gk:
         result["errors"].append({
-            "type": "generic_key_missing",
-            "message": "Tidak dapat mendeteksi kolom Generic Key di header/detail. Mohon verifikasi nama kolom.",
+            "code": "GENKEY_MISSING",
+            "severity": "CRITICAL",
+            "message": "Tidak dapat mendeteksi kolom Generic Key di header/detail.",
             "details": {"header_cols": list(header_df.columns), "detail_cols": list(detail_df.columns)}
         })
         result["summary"].append(("generic_key_detected", False))
         return result
 
     result["summary"].append(("generic_key_detected", True))
-    # 1) GenericKey consistency
-    header_keys = set(header_df[header_gk].dropna().astype(str).unique())
-    detail_keys = set(detail_df[detail_gk].dropna().astype(str).unique())
+
+    # normalize strings
+    header_df[header_gk] = header_df[header_gk].astype(str).str.strip()
+    detail_df[detail_gk] = detail_df[detail_gk].astype(str).str.strip()
+    header_keys = set(header_df[header_gk].dropna().unique())
+    detail_keys = set(detail_df[detail_gk].dropna().unique())
+
+    # RULE 1: GenericKey in Detail must exist in Header (CRITICAL)
     missing_in_header = sorted(list(detail_keys - header_keys))
-    if missing_in_header:
-        result["errors"].append({
-            "type": "missing_header_for_detail_generic_key",
-            "message": f"{len(missing_in_header)} GenericKey(s) di Detail tidak ditemukan di Header",
-            "details": missing_in_header[:50]
-        })
-    result["summary"].append(("generic_key_mismatch_count", len(missing_in_header)))
-
-    # 2) Header duplicate GenericKey (header split) and LOTTABLE01 differences
-    dup_header = header_df[header_df[header_gk].duplicated(keep=False)].sort_values(header_gk) if header_gk in header_df.columns else pd.DataFrame()
-    if not dup_header.empty:
-        dup_groups = dup_header.groupby(header_gk)
-        split_warnings = []
-        for k, g in dup_groups:
-            l01 = set(g.get("LOTTABLE01", pd.Series([], dtype=str)).dropna().astype(str).unique())
-            if len(l01) > 1:
-                split_warnings.append((k, list(l01)))
-        if split_warnings:
-            result["errors"].append({
-                "type": "header_split_by_lottable01",
-                "message": "Beberapa GenericKey di header muncul beberapa kali dengan LOTTABLE01 berbeda (kemungkinan header terpecah menjadi beberapa shipment).",
-                "details": split_warnings[:50]
+    for mk in missing_in_header:
+        sample_rows = detail_df[detail_df[detail_gk] == mk].index[:5].tolist()
+        for r in sample_rows:
+            result["error_rows"].append({
+                "row_index": int(r) + 2,
+                "sheet": sheet_detail,
+                "generic_key": mk,
+                "column": detail_gk,
+                "value": str(detail_df.at[r, detail_gk]),
+                "rule": "GENKEY_MISSING_IN_HEADER",
+                "severity": "CRITICAL",
+                "message": "GenericKey di Detail tidak ditemukan di Header",
+                "suggested_fix": "Tambahkan GenericKey di sheet Data atau gunakan GenericKey yang benar"
             })
-        result["summary"].append(("header_duplicate_generickey_count", int(len(dup_header))))
-    else:
-        result["summary"].append(("header_duplicate_generickey_count", 0))
+    result["summary"].append(("genkey_missing_count", len(missing_in_header)))
 
-    # 3) Pattern checks across LOTTABLEs in detail
-    lottable_cols = [c for c in detail_df.columns if c and str(c).upper().startswith("LOTTABLE")]
-    pattern_report = []
-    for col in lottable_cols:
-        expected_pat = PATTERNS.get(str(col).upper())
-        frac = pattern_match_fraction(detail_df.get(col, pd.Series([], dtype=str)).astype(str), expected_pat) if expected_pat is not None else 1.0
-        pattern_report.append((col, frac, expected_pat is not None))
-        if expected_pat is not None and frac < MATCH_THRESHOLD:
-            result["errors"].append({
-                "type": "lottable_pattern_mismatch",
-                "message": f"{col} hanya cocok dengan pola yang diharapkan untuk {frac:.0%} baris (< {MATCH_THRESHOLD:.0%}). Mungkin mapping tertukar atau format salah.",
-                "details": {"column": col, "match_fraction": float(frac)}
-            })
-    # include pattern_report in summary
-    for col, frac, has in pattern_report:
-        result["summary"].append((f"pattern_match_frac_{col}", float(frac)))
-
-    # 4) Uniqueness checks
-    for col in UNIQUE_LOTTABLES:
-        if col in detail_df.columns:
-            dupvals = detail_df[col].dropna().astype(str)
-            dup_counts = dupvals.value_counts()
-            duplicates = dup_counts[dup_counts > 1]
-            if not duplicates.empty:
+    # RULE 2: LOTTABLE01 behavior
+    # Header: check if one GenericKey maps to >1 different LOTTABLE01 -> CRITICAL
+    if "LOTTABLE01" in header_df.columns:
+        hdr_grp = header_df.groupby(header_gk)["LOTTABLE01"].agg(
+            lambda s: sorted(set([str(v).strip() for v in s.dropna()]))
+        )
+        for gk, lvals in hdr_grp.items():
+            if len(lvals) > 1:
                 result["errors"].append({
-                    "type": "lottable_uniqueness_violation",
-                    "message": f"{col} seharusnya unik tapi ditemukan {len(duplicates)} value duplicate.",
-                    "details": duplicates.head(20).to_dict()
+                    "code": "HEADER_LOTTABLE01_SPLIT",
+                    "severity": "CRITICAL",
+                    "message": f"GenericKey '{gk}' muncul di header dengan beberapa LOTTABLE01 berbeda.",
+                    "details": {"generic_key": gk, "header_lottable01": lvals}
                 })
 
-    # 5) Suspicious swap heuristic
-    suspicious_swaps = []
-    for expected_col, pattern in PATTERNS.items():
+    # Header LOTTABLE01 should exist in detail LOTTABLE01 set for same GenericKey
+    if "LOTTABLE01" in header_df.columns and "LOTTABLE01" in detail_df.columns:
+        det_map = detail_df.groupby(detail_gk)["LOTTABLE01"].agg(
+            lambda s: set([str(v).strip() for v in s.dropna()])
+        ).to_dict()
+        for idx, hrow in header_df.iterrows():
+            gk = str(hrow.get(header_gk, "")).strip()
+            h_l01 = str(hrow.get("LOTTABLE01", "")).strip()
+            if gk and h_l01:
+                det_vals = det_map.get(gk, set())
+                if len(det_vals) == 0:
+                    result["error_rows"].append({
+                        "row_index": int(idx) + 2,
+                        "sheet": sheet_header,
+                        "generic_key": gk,
+                        "column": "LOTTABLE01",
+                        "value": h_l01,
+                        "rule": "HEADER_LOTTABLE01_NOT_IN_DETAIL",
+                        "severity": "CRITICAL",
+                        "message": "LOTTABLE01 di header tidak cocok dengan LOTTABLE01 mana pun di Detail untuk GenericKey ini.",
+                        "suggested_fix": "Pastikan header LOTTABLE01 sama dengan salah satu nilai LOTTABLE01 di sheet Detail untuk GenericKey yang sama"
+                    })
+                else:
+                    if h_l01 not in det_vals:
+                        result["error_rows"].append({
+                            "row_index": int(idx) + 2,
+                            "sheet": sheet_header,
+                            "generic_key": gk,
+                            "column": "LOTTABLE01",
+                            "value": h_l01,
+                            "rule": "HEADER_LOTTABLE01_MISMATCH",
+                            "severity": "CRITICAL",
+                            "message": "LOTTABLE01 di header tidak ditemukan di baris Detail untuk GenericKey yang sama.",
+                            "suggested_fix": "Perbaiki LOTTABLE01 di header supaya cocok dengan salah satu LOTTABLE01 di Detail"
+                        })
+
+    # RULE 3..5: Pattern checks for ProjectID (LOTTABLE03), WBS (LOTTABLE06), FASID (LOTTABLE10)
+    lottable_cols = [c for c in detail_df.columns if c and str(c).upper().startswith("LOTTABLE")]
+    for col in lottable_cols:
+        pattern = PATTERNS.get(str(col).upper())
         if pattern is None:
             continue
-        col_fracs = {}
-        for col in lottable_cols:
-            frac = pattern_match_fraction(detail_df.get(col, pd.Series([], dtype=str)).astype(str), pattern)
-            col_fracs[col] = frac
-        curr_frac = col_fracs.get(expected_col, 0)
-        best_col = max(col_fracs, key=lambda c: col_fracs[c]) if col_fracs else None
-        if best_col and best_col != expected_col and (col_fracs[best_col] - curr_frac) > 0.4:
-            suspicious_swaps.append({
-                "expected_lottable": expected_col,
-                "best_matching_col": best_col,
-                "expected_match_frac": float(curr_frac),
-                "best_match_frac": float(col_fracs[best_col])
+        series = detail_df.get(col, pd.Series([], dtype=str)).astype(str)
+        for i, val in series.items():
+            v = val.strip()
+            if not v:
+                # Decide: allow blank values (not blocking) — if you want to block empties, change here.
+                continue
+            if not pattern.search(v):
+                sev = "CRITICAL" if str(col).upper() in ("LOTTABLE03", "LOTTABLE06", "LOTTABLE10") else "WARNING"
+                result["error_rows"].append({
+                    "row_index": int(i) + 2,
+                    "sheet": sheet_detail,
+                    "generic_key": str(detail_df.at[i, detail_gk]) if detail_gk in detail_df.columns else "",
+                    "column": col,
+                    "value": v,
+                    "rule": f"{col}_PATTERN_MISMATCH",
+                    "severity": sev,
+                    "message": f"{col} tidak cocok pola yang diharapkan",
+                    "suggested_fix": "Periksa format sesuai aturan perusahaan"
+                })
+
+    # RULE 6: Owner leakage (owner value should ideally stay in LOTTABLE09)
+    if "LOTTABLE09" in detail_df.columns:
+        owner_series = detail_df["LOTTABLE09"].astype(str).str.strip()
+        other_lottables = [c for c in lottable_cols if str(c).upper() != "LOTTABLE09"]
+        for i, owner_val in owner_series.items():
+            if not owner_val:
+                continue
+            for c in other_lottables:
+                other_val = str(detail_df.at[i, c]).strip() if c in detail_df.columns else ""
+                if other_val and other_val == owner_val:
+                    result["error_rows"].append({
+                        "row_index": int(i) + 2,
+                        "sheet": sheet_detail,
+                        "generic_key": str(detail_df.at[i, detail_gk]) if detail_gk in detail_df.columns else "",
+                        "column": c,
+                        "value": other_val,
+                        "rule": "OWNER_LEAKAGE",
+                        "severity": "WARNING",
+                        "message": f"Value owner ditemukan di kolom {c} (kemungkinan mapping tertukar).",
+                        "suggested_fix": "Periksa mapping kolom; nilai Owner seharusnya di LOTTABLE09"
+                    })
+
+    # Build errors_summary: aggregate from error_rows
+    err_rows_df = pd.DataFrame(result["error_rows"])
+    if not err_rows_df.empty:
+        rule_counts = err_rows_df["rule"].value_counts().to_dict()
+        for r, cnt in rule_counts.items():
+            # determine severity by checking any row of that rule having CRITICAL
+            rule_sev = "CRITICAL" if any(err_rows_df[err_rows_df["rule"] == r]["severity"] == "CRITICAL") else "WARNING"
+            result["errors"].append({
+                "code": r,
+                "severity": rule_sev,
+                "message": f"{cnt} occurrence(s) of {r}",
+                "details": {}
             })
-    if suspicious_swaps:
-        result["errors"].append({
-            "type": "suspicious_mapping_swaps",
-            "message": "Ditemukan LOTTABLE yang kemungkinan tertukar berdasarkan pola nilai.",
-            "details": suspicious_swaps
-        })
 
-    # 6) Row-level checks (example)
-    error_rows = []
-    for i, row in detail_df.iterrows():
-        r_errors = []
-        gk = str(row.get(detail_gk, "")).strip()
-        if not gk:
-            r_errors.append("GenericKey kosong")
-        else:
-            if gk not in header_keys:
-                r_errors.append("GenericKey tidak ada di Header")
-        # LOTTABLE06 WBS strict check if column exists
-        if "LOTTABLE06" in detail_df.columns:
-            v = str(row.get("LOTTABLE06", "")).strip()
-            pat = PATTERNS.get("LOTTABLE06")
-            if v and not pat.search(v):
-                r_errors.append("LOTTABLE06 (WBS) tidak cocok pola yang diharapkan")
-        # LOTTABLE03 ProjectID check
-        if "LOTTABLE03" in detail_df.columns:
-            v = str(row.get("LOTTABLE03", "")).strip()
-            pat = PATTERNS.get("LOTTABLE03")
-            if v and not pat.search(v):
-                r_errors.append("LOTTABLE03 (ProjectID) tidak cocok pola yang diharapkan")
-        # LOTTABLE10 FASID check
-        if "LOTTABLE10" in detail_df.columns:
-            v = str(row.get("LOTTABLE10", "")).strip()
-            pat = PATTERNS.get("LOTTABLE10")
-            if v and not pat.search(v):
-                r_errors.append("LOTTABLE10 (FASID) tidak cocok pola 'numeric|text'")
-        if r_errors:
-            error_rows.append({"row_index": i + 2, "generic_key": gk, "errors": "; ".join(r_errors)})
+    # summary metrics
+    result["summary"].append(("header_rows", int(len(header_df))))
+    result["summary"].append(("detail_rows", int(len(detail_df))))
+    result["summary"].append(("error_rows_count", int(len(err_rows_df))))
+    # gate result: any CRITICAL in error_rows -> BLOCKED
+    has_critical = False
+    if not err_rows_df.empty:
+        has_critical = any(err_rows_df["severity"] == "CRITICAL")
+    result["summary"].append(("gate_blocked", bool(has_critical)))
 
-    result["error_rows"] = pd.DataFrame(error_rows)
+    # attach final DataFrames
+    result["error_rows"] = err_rows_df if not err_rows_df.empty else pd.DataFrame(columns=[
+        "row_index","sheet","generic_key","column","value","rule","severity","message","suggested_fix"
+    ])
     result["errors_summary"] = pd.DataFrame(result["errors"])
     result["summary_df"] = pd.DataFrame(result["summary"], columns=["metric", "value"])
 
@@ -254,7 +298,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
 # Streamlit UI
 # ----------------------
 st.title("WMS Mapping Validator (Streamlit)")
-st.markdown("Upload file Excel hasil mapping (sheet `Data` = header, `Detail` = detail). Aplikasi akan menjalankan sejumlah check pola & konsistensi GenericKey.")
+st.markdown("Upload file Excel hasil mapping (sheet `Data` = header, `Detail` = detail). Aplikasi akan menjalankan check sesuai rule yang disepakati dan menghasilkan report actionable (baris & kolom yang salah).")
 
 uploaded_file = st.file_uploader("Pilih file Excel (.xls / .xlsx)", type=["xls","xlsx"])
 col1, col2 = st.columns(2)
@@ -286,17 +330,19 @@ if uploaded_file:
 
         # show errors summary
         st.subheader("Errors / Warnings")
-        if res.get("errors_summary") is None or res["errors_summary"].empty:
+        errs_summary_df = res.get("errors_summary", pd.DataFrame(res.get("errors", [])))
+        if errs_summary_df is None or errs_summary_df.empty:
             st.success("No major errors detected.")
         else:
-            st.table(res["errors_summary"])
+            st.table(errs_summary_df)
 
         # row-level errors
         st.subheader("Row-level errors (detail)")
-        if res.get("error_rows") is None or res["error_rows"].empty:
+        err_rows = res.get("error_rows", pd.DataFrame())
+        if err_rows is None or err_rows.empty:
             st.info("No row-level errors found.")
         else:
-            st.dataframe(res["error_rows"])
+            st.dataframe(err_rows)
 
         # show original sheets (toggle)
         if st.checkbox("Tampilkan data header & detail"):
@@ -307,13 +353,14 @@ if uploaded_file:
 
         # prepare downloadable report
         out_dfs = {}
-        # add summary
         out_dfs["summary"] = res.get("summary_df", pd.DataFrame(res.get("summary", []), columns=["metric","value"]))
-        out_dfs["errors_summary"] = res.get("errors_summary", pd.DataFrame(res.get("errors", [])))
-        if not res.get("error_rows", pd.DataFrame()).empty:
-            out_dfs["errors_rows"] = res["error_rows"]
-        # include originals
+        out_dfs["errors_summary"] = errs_summary_df
+        if not err_rows.empty:
+            out_dfs["errors_rows"] = err_rows
         out_dfs.update(res.get("orig", {}))
 
         excel_bytes = to_excel_bytes(out_dfs)
-        st.download_button("Download validation report (xlsx)", data=excel_bytes, file_name="validation_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Download validation report (xlsx)",
+                           data=excel_bytes,
+                           file_name="validation_report.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
