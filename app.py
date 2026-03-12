@@ -63,7 +63,9 @@ def to_excel_bytes(dfs_dict):
 # ----------------------
 # Validation logic
 # ----------------------
-def validate_workbook(xls, sheet_header="Data", sheet_detail="Detail"):
+def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
+
+    xls = pd.read_excel(file, sheet_name=None, dtype=str)
     sheets = list(xls.keys())
     result = {"summary": [], "errors": [], "error_rows": [], "orig": {}}
 
