@@ -209,7 +209,10 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
                         })
 
     # RULE 3..5: Pattern checks for ProjectID (LOTTABLE03), WBS (LOTTABLE06), FASID (LOTTABLE10)
-    lottable_cols = [c for c in detail_df.columns if c and str(c).upper().startswith("LOTTABLE")]
+    lottable_cols = [
+        c for c in detail_df.columns
+        if c and str(c).upper().startswith("LOTTABLE") and str(c).upper() != "LOTTABLE07"
+    ]
     for col in lottable_cols:
         pattern = PATTERNS.get(str(col).upper())
         if pattern is None:
