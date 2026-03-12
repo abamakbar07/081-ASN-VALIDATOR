@@ -10,13 +10,11 @@ st.set_page_config(page_title="WMS Mapping Validator", layout="wide")
 # ----------------------
 # Config / patterns
 # ----------------------
+# Jika data di sheet mulai pada Excel row ke-3, maka header ada di row ke-2 -> header index = 1 (0-based)
+HEADER_ROW = 1  # <-- ubah kalau header berada di baris lain (0-based)
 MATCH_THRESHOLD = 0.5
 
 # Patterns based on rules:
-# - LOTTABLE01: shipment|PO
-# - LOTTABLE03: ProjectID starts with 1105/2609/0000
-# - LOTTABLE06: WBS full pattern OR short like EID21/EID24
-# - LOTTABLE10: FASID numeric|text
 PATTERNS = {
     "LOTTABLE01": re.compile(r"^[^|]+\|[^|]+$"),               # shipment|PO
     "LOTTABLE02": None,                                       # Project Scope (free text)
@@ -60,12 +58,10 @@ def to_excel_bytes(dfs_dict):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, df in dfs_dict.items():
-            # ensure sheet name length <= 31
             safe_name = str(name)[:31]
             if isinstance(df, pd.DataFrame):
                 df.to_excel(writer, sheet_name=safe_name, index=False)
             else:
-                # fallback: wrap into DataFrame
                 pd.DataFrame([str(df)]).to_excel(writer, sheet_name=safe_name, index=False)
     buffer.seek(0)
     return buffer
@@ -76,17 +72,14 @@ def to_excel_bytes(dfs_dict):
 def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
     """
     Reads an Excel workbook (path or file-like) and validates according to rules.
-    Returns dict with:
-      - summary_df (DataFrame)
-      - errors_summary (DataFrame)
-      - error_rows (DataFrame)
-      - orig (dict of original DataFrames)
+    Uses HEADER_ROW (0-based) as header line.
+    Returns dict with summary_df, errors_summary, error_rows, orig.
     """
     result = {"summary": [], "errors": [], "error_rows": [], "orig": {}}
 
-    # read workbook as dict of DataFrames
+    # read workbook as dict of DataFrames using HEADER_ROW as header row
     try:
-        xls_dict = pd.read_excel(file_like, sheet_name=None, dtype=str)
+        xls_dict = pd.read_excel(file_like, sheet_name=None, header=HEADER_ROW, dtype=str)
     except Exception as e:
         result["errors"].append({
             "code": "FILE_READ_ERROR",
@@ -99,7 +92,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
 
     sheets = list(xls_dict.keys())
 
-    # auto-detect sheet names if default not present
+    # auto-detect sheet names if defaults not found
     if sheet_header not in sheets or sheet_detail not in sheets:
         header_sheet = find_similar_column(sheets, [sheet_header, "Header", "Data"])
         detail_sheet = find_similar_column(sheets, [sheet_detail, "Detail", "Lines", "Items"])
@@ -149,8 +142,9 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
     for mk in missing_in_header:
         sample_rows = detail_df[detail_df[detail_gk] == mk].index[:5].tolist()
         for r in sample_rows:
+            excel_row = int(r) + HEADER_ROW + 2
             result["error_rows"].append({
-                "row_index": int(r) + 2,
+                "row_index": excel_row,
                 "sheet": sheet_detail,
                 "generic_key": mk,
                 "column": detail_gk,
@@ -162,8 +156,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
             })
     result["summary"].append(("genkey_missing_count", len(missing_in_header)))
 
-    # RULE 2: LOTTABLE01 behavior
-    # Header: check if one GenericKey maps to >1 different LOTTABLE01 -> CRITICAL
+    # RULE 2: LOTTABLE01 checks
     if "LOTTABLE01" in header_df.columns:
         hdr_grp = header_df.groupby(header_gk)["LOTTABLE01"].agg(
             lambda s: sorted(set([str(v).strip() for v in s.dropna()]))
@@ -177,7 +170,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
                     "details": {"generic_key": gk, "header_lottable01": lvals}
                 })
 
-    # Header LOTTABLE01 should exist in detail LOTTABLE01 set for same GenericKey
+    # header LOTTABLE01 must match at least one detail LOTTABLE01 for same GenericKey
     if "LOTTABLE01" in header_df.columns and "LOTTABLE01" in detail_df.columns:
         det_map = detail_df.groupby(detail_gk)["LOTTABLE01"].agg(
             lambda s: set([str(v).strip() for v in s.dropna()])
@@ -188,8 +181,9 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
             if gk and h_l01:
                 det_vals = det_map.get(gk, set())
                 if len(det_vals) == 0:
+                    excel_row = int(idx) + HEADER_ROW + 2
                     result["error_rows"].append({
-                        "row_index": int(idx) + 2,
+                        "row_index": excel_row,
                         "sheet": sheet_header,
                         "generic_key": gk,
                         "column": "LOTTABLE01",
@@ -201,8 +195,9 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
                     })
                 else:
                     if h_l01 not in det_vals:
+                        excel_row = int(idx) + HEADER_ROW + 2
                         result["error_rows"].append({
-                            "row_index": int(idx) + 2,
+                            "row_index": excel_row,
                             "sheet": sheet_header,
                             "generic_key": gk,
                             "column": "LOTTABLE01",
@@ -223,12 +218,12 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
         for i, val in series.items():
             v = val.strip()
             if not v:
-                # Decide: allow blank values (not blocking) — if you want to block empties, change here.
                 continue
             if not pattern.search(v):
                 sev = "CRITICAL" if str(col).upper() in ("LOTTABLE03", "LOTTABLE06", "LOTTABLE10") else "WARNING"
+                excel_row = int(i) + HEADER_ROW + 2
                 result["error_rows"].append({
-                    "row_index": int(i) + 2,
+                    "row_index": excel_row,
                     "sheet": sheet_detail,
                     "generic_key": str(detail_df.at[i, detail_gk]) if detail_gk in detail_df.columns else "",
                     "column": col,
@@ -239,7 +234,7 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
                     "suggested_fix": "Periksa format sesuai aturan perusahaan"
                 })
 
-    # RULE 6: Owner leakage (owner value should ideally stay in LOTTABLE09)
+    # RULE 6: Owner leakage
     if "LOTTABLE09" in detail_df.columns:
         owner_series = detail_df["LOTTABLE09"].astype(str).str.strip()
         other_lottables = [c for c in lottable_cols if str(c).upper() != "LOTTABLE09"]
@@ -249,8 +244,9 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
             for c in other_lottables:
                 other_val = str(detail_df.at[i, c]).strip() if c in detail_df.columns else ""
                 if other_val and other_val == owner_val:
+                    excel_row = int(i) + HEADER_ROW + 2
                     result["error_rows"].append({
-                        "row_index": int(i) + 2,
+                        "row_index": excel_row,
                         "sheet": sheet_detail,
                         "generic_key": str(detail_df.at[i, detail_gk]) if detail_gk in detail_df.columns else "",
                         "column": c,
@@ -261,12 +257,11 @@ def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
                         "suggested_fix": "Periksa mapping kolom; nilai Owner seharusnya di LOTTABLE09"
                     })
 
-    # Build errors_summary: aggregate from error_rows
+    # Build errors_summary from error_rows
     err_rows_df = pd.DataFrame(result["error_rows"])
     if not err_rows_df.empty:
         rule_counts = err_rows_df["rule"].value_counts().to_dict()
         for r, cnt in rule_counts.items():
-            # determine severity by checking any row of that rule having CRITICAL
             rule_sev = "CRITICAL" if any(err_rows_df[err_rows_df["rule"] == r]["severity"] == "CRITICAL") else "WARNING"
             result["errors"].append({
                 "code": r,
