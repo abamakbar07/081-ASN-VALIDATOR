@@ -56,20 +56,40 @@ def to_excel_bytes(dfs_dict):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, df in dfs_dict.items():
-            df.to_excel(writer, sheet_name=name, index=False)
+            # ensure df is a DataFrame
+            if isinstance(df, pd.DataFrame):
+                df.to_excel(writer, sheet_name=name[:31], index=False)
+            else:
+                # fallback: wrap into DataFrame
+                pd.DataFrame([str(df)]).to_excel(writer, sheet_name=name[:31], index=False)
     buffer.seek(0)
     return buffer
 
 # ----------------------
 # Validation logic
 # ----------------------
-def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
-
-    xls = pd.read_excel(file, sheet_name=None, dtype=str)
-    sheets = list(xls.keys())
+def validate_workbook(file_like, sheet_header="Data", sheet_detail="Detail"):
+    """
+    file_like: path or file-like object (e.g. Streamlit UploadedFile)
+    returns dict with keys: summary_df, errors_summary (DataFrame), error_rows (DataFrame), orig (dict of DataFrames)
+    """
     result = {"summary": [], "errors": [], "error_rows": [], "orig": {}}
 
-    # find header/detail with fallback
+    # try read entire workbook as dict of dataframes
+    try:
+        xls_dict = pd.read_excel(file_like, sheet_name=None, dtype=str)
+    except Exception as e:
+        result["errors"].append({
+            "type": "file_read_error",
+            "message": f"Gagal membaca file Excel: {e}",
+            "details": {}
+        })
+        result["summary"].append(("file_read_ok", False))
+        return result
+
+    sheets = list(xls_dict.keys())
+
+    # fallback: try to auto-detect header/detail sheet names
     if sheet_header not in sheets or sheet_detail not in sheets:
         header_sheet = find_similar_column(sheets, [sheet_header, "Header", "Data"])
         detail_sheet = find_similar_column(sheets, [sheet_detail, "Detail", "Lines", "Items"])
@@ -78,8 +98,18 @@ def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
         if detail_sheet:
             sheet_detail = detail_sheet
 
-    header_df = pd.read_excel(xls, sheet_name=sheet_header, dtype=str)
-    detail_df = pd.read_excel(xls, sheet_name=sheet_detail, dtype=str)
+    # if still not found, return friendly error
+    if sheet_header not in sheets or sheet_detail not in sheets:
+        result["errors"].append({
+            "type": "sheet_missing",
+            "message": "Nama sheet header/detail tidak ditemukan di workbook.",
+            "details": {"available_sheets": sheets, "requested_header": sheet_header, "requested_detail": sheet_detail}
+        })
+        result["summary"].append(("sheets_found", False))
+        return result
+
+    header_df = xls_dict[sheet_header].copy()
+    detail_df = xls_dict[sheet_detail].copy()
 
     result["orig"][f"orig_{sheet_header}"] = header_df
     result["orig"][f"orig_{sheet_detail}"] = detail_df
@@ -93,8 +123,10 @@ def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
             "message": "Tidak dapat mendeteksi kolom Generic Key di header/detail. Mohon verifikasi nama kolom.",
             "details": {"header_cols": list(header_df.columns), "detail_cols": list(detail_df.columns)}
         })
+        result["summary"].append(("generic_key_detected", False))
         return result
 
+    result["summary"].append(("generic_key_detected", True))
     # 1) GenericKey consistency
     header_keys = set(header_df[header_gk].dropna().astype(str).unique())
     detail_keys = set(detail_df[detail_gk].dropna().astype(str).unique())
@@ -122,22 +154,22 @@ def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
                 "message": "Beberapa GenericKey di header muncul beberapa kali dengan LOTTABLE01 berbeda (kemungkinan header terpecah menjadi beberapa shipment).",
                 "details": split_warnings[:50]
             })
-        result["summary"].append(("header_duplicate_generickey_count", len(dup_header)))
+        result["summary"].append(("header_duplicate_generickey_count", int(len(dup_header))))
     else:
         result["summary"].append(("header_duplicate_generickey_count", 0))
 
     # 3) Pattern checks across LOTTABLEs in detail
-    lottable_cols = [c for c in detail_df.columns if c.upper().startswith("LOTTABLE")]
+    lottable_cols = [c for c in detail_df.columns if c and str(c).upper().startswith("LOTTABLE")]
     pattern_report = []
     for col in lottable_cols:
-        expected_pat = PATTERNS.get(col.upper())
+        expected_pat = PATTERNS.get(str(col).upper())
         frac = pattern_match_fraction(detail_df.get(col, pd.Series([], dtype=str)).astype(str), expected_pat) if expected_pat is not None else 1.0
         pattern_report.append((col, frac, expected_pat is not None))
         if expected_pat is not None and frac < MATCH_THRESHOLD:
             result["errors"].append({
                 "type": "lottable_pattern_mismatch",
                 "message": f"{col} hanya cocok dengan pola yang diharapkan untuk {frac:.0%} baris (< {MATCH_THRESHOLD:.0%}). Mungkin mapping tertukar atau format salah.",
-                "details": {"column": col, "match_fraction": frac}
+                "details": {"column": col, "match_fraction": float(frac)}
             })
     # include pattern_report in summary
     for col, frac, has in pattern_report:
@@ -171,8 +203,8 @@ def validate_workbook(file, sheet_header="Data", sheet_detail="Detail"):
             suspicious_swaps.append({
                 "expected_lottable": expected_col,
                 "best_matching_col": best_col,
-                "expected_match_frac": curr_frac,
-                "best_match_frac": col_fracs[best_col]
+                "expected_match_frac": float(curr_frac),
+                "best_match_frac": float(col_fracs[best_col])
             })
     if suspicious_swaps:
         result["errors"].append({
@@ -230,14 +262,16 @@ sheet_header = col1.text_input("Nama sheet header", value="Data")
 sheet_detail = col2.text_input("Nama sheet detail", value="Detail")
 
 if uploaded_file:
+    # preview sheet names safely
     try:
-        xls = pd.ExcelFile(uploaded_file)
+        preview_xls = pd.ExcelFile(uploaded_file)
+        available_sheets = preview_xls.sheet_names
     except Exception as e:
-        st.error(f"Gagal membaca file: {e}")
-        st.stop()
+        st.error(f"Gagal membaca sheet names: {e}")
+        available_sheets = []
 
     with st.expander("Preview sheet names"):
-        st.write(xls.sheet_names)
+        st.write(available_sheets)
 
     if st.button("Validate"):
         with st.spinner("Running validations..."):
@@ -245,18 +279,21 @@ if uploaded_file:
 
         # show summary
         st.subheader("Summary metrics")
-        st.dataframe(res["summary_df"])
+        if "summary_df" in res and isinstance(res["summary_df"], pd.DataFrame):
+            st.dataframe(res["summary_df"])
+        else:
+            st.write(pd.DataFrame(res.get("summary", []), columns=["metric", "value"]))
 
         # show errors summary
         st.subheader("Errors / Warnings")
-        if res["errors_summary"].empty:
+        if res.get("errors_summary") is None or res["errors_summary"].empty:
             st.success("No major errors detected.")
         else:
             st.table(res["errors_summary"])
 
         # row-level errors
         st.subheader("Row-level errors (detail)")
-        if res["error_rows"].empty:
+        if res.get("error_rows") is None or res["error_rows"].empty:
             st.info("No row-level errors found.")
         else:
             st.dataframe(res["error_rows"])
@@ -269,14 +306,14 @@ if uploaded_file:
             st.dataframe(res["orig"].get(f"orig_{sheet_detail}", pd.DataFrame()).head(200))
 
         # prepare downloadable report
-        out_dfs = {
-            "summary": res["summary_df"],
-            "errors_summary": res["errors_summary"],
-        }
-        if not res["error_rows"].empty:
+        out_dfs = {}
+        # add summary
+        out_dfs["summary"] = res.get("summary_df", pd.DataFrame(res.get("summary", []), columns=["metric","value"]))
+        out_dfs["errors_summary"] = res.get("errors_summary", pd.DataFrame(res.get("errors", [])))
+        if not res.get("error_rows", pd.DataFrame()).empty:
             out_dfs["errors_rows"] = res["error_rows"]
         # include originals
-        out_dfs.update(res["orig"])
+        out_dfs.update(res.get("orig", {}))
 
         excel_bytes = to_excel_bytes(out_dfs)
         st.download_button("Download validation report (xlsx)", data=excel_bytes, file_name="validation_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
