@@ -1,103 +1,132 @@
-# WMS Template Validator
+# WMS Template Validation Tool
 
-A lightweight validation tool built with Python and Streamlit to verify Excel templates before uploading them into a Warehouse Management System (WMS).
+## Overview
 
-This tool helps detect common data mapping mistakes in operational templates such as incorrect field formats, missing references, or mismatched identifiers.
+This project provides a lightweight validation tool built with **Python** and **Streamlit** to validate structured Excel templates used in warehouse operational processes.
 
-The application was originally developed to support day-to-day warehouse operations and reduce human errors during data preparation before system uploads.
+The tool helps detect formatting issues, inconsistent keys, and incorrect data mappings **before the data is processed by downstream systems**. This reduces manual checking and helps prevent operational errors.
 
----
-
-## Features
-
-- Excel template validation
-- Column format validation
-- Generic Key consistency check
-- Shipment reference validation
-- WBS format validation
-- Project ID format validation
-- FASID format validation
-- Row-level error reporting
-- Downloadable validation report
-
-The tool highlights exactly which row and column contain issues so they can be corrected quickly.
+The application was originally developed to support day‑to‑day operational workflows in a warehouse environment. All company‑specific data, naming conventions, and internal templates have been **anonymized** for confidentiality.
 
 ---
 
-## Supported Validations
+## Key Features
 
-The validator checks several operational rules such as:
+* Validate Excel mapping templates with **Header and Detail structure**
+* Detect missing or inconsistent **Generic Keys** between sheets
+* Pattern validation for specific fields
+* Row‑level error reporting with actionable messages
+* Excel validation report export
+* Optional **column anonymization** for safe public sharing
 
-- GenericKey in Detail sheet must exist in Header sheet
-- Shipment references must match between Header and Detail
-- WBS format validation
-- ProjectID format validation
-- FASID format validation
-- Detection of mapping errors between columns
+---
 
-Serial Number fields (LOTTABLE07) are intentionally excluded from validation.
+## Technology Stack
+
+* Python
+* Streamlit
+* Pandas
+* OpenPyXL
 
 ---
 
 ## How It Works
 
-1. Upload an Excel template
-2. Run validation
-3. Review validation results
-4. Download validation report
-5. Correct the template before uploading into WMS
+1. Upload the Excel mapping template
+
+2. The system scans the workbook and detects the header and detail sheets
+
+3. Validation rules are applied to check:
+
+   * Key consistency
+   * Column format rules
+   * Mapping integrity
+   * Data anomalies
+
+4. The application generates:
+
+   * Summary validation metrics
+   * Error summary
+   * Row‑level error details
+   * Downloadable validation report
+
+---
+
+## Example Validation Checks
+
+The validator includes several automated checks such as:
+
+* Generic key mismatch between header and detail sheets
+* Invalid column format patterns
+* Inconsistent mapping values
+* Potential mapping leakage between fields
+
+These checks help ensure that uploaded templates follow the expected structure before being used in operational workflows.
 
 ---
 
 ## Installation
 
-Install required dependencies:
+Clone the repository:
 
+```
+git clone https://github.com/yourusername/wms-template-validator.git
+cd wms-template-validator
+```
 
-pip install pandas openpyxl xlrd streamlit
+Install dependencies:
 
+```
+pip install -r requirements.txt
+```
 
----
+Run the application:
 
-## Run the Application
-
-
-python -m streamlit run app.py
-
-
-Then open the browser:
-
-
-http://localhost:8501
-
-
----
-
-## Project Structure
-
-
-.
-├── app.py
-├── run_validator.bat
-└── README.md
-
+```
+streamlit run app.py
+```
 
 ---
 
-## Operational Context
+## Usage
 
-This tool was built to assist operational workflows in warehouse environments where Excel templates are used to prepare data before uploading into a Warehouse Management System.
-
-The validator helps reduce errors that may cause incorrect order creation or system data inconsistencies.
+1. Start the Streamlit application
+2. Upload the Excel template
+3. Run validation
+4. Review detected errors
+5. Download the validation report
 
 ---
 
-## Disclaimer
+## Data Privacy Notice
 
-This repository contains a generalized validation tool and does not include any confidential data, system credentials, or proprietary business information.
+This repository **does not contain any real operational data**.
+
+All column names, templates, and datasets in this repository have been **anonymized and simplified** to remove any sensitive information related to internal warehouse systems.
+
+The project is shared strictly for **demonstration and portfolio purposes**.
+
+---
+
+## Possible Improvements
+
+Future improvements may include:
+
+* Configurable validation rules
+* Support for additional template formats
+* Integration with automated data pipelines
+* Role‑based validation workflows
 
 ---
 
 ## Author
 
-Developed as a personal automation project to improve operational efficiency in in warehouse data preparation workflows.
+Muhamad Akbar Afriansyah
+
+Warehouse Operations & Process Automation Enthusiast
+
+---
+
+## License
+
+This project is shared for educational and demonstration purposes.
