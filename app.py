@@ -19,8 +19,9 @@ PATTERNS = {
     "LOTTABLE03": re.compile(r"^(?:1105|2609|0000)\.[A-Z0-9\-]+$", re.I),
     "LOTTABLE06": re.compile(r"^(?:[A-Z0-9]{3,}\.\d{6}\.\d{5}|EID\d{2,})$", re.I),
     "LOTTABLE07": re.compile(r"[A-Z0-9\-]{4,}", re.I),
-    "LOTTABLE09": None,
-    "LOTTABLE10": re.compile(r"^\d+\|.+$"),
+    "LOTTABLE09": re.compile(r"^\d{6}$"),
+    "LOTTABLE10": re.compile(r"^\d{8}$"),
+    "NOTE": re.compile(r"^\d+\|.+$"),
 }
 
 UNIQUE_LOTTABLES = ["LOTTABLE01"]
